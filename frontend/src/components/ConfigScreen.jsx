@@ -34,14 +34,13 @@ function ConfigScreen({ onClose, onSave }) {
             if (data.region.radiusMiles && RADIUS_OPTIONS.includes(data.region.radiusMiles)) {
               setRadiusMiles(data.region.radiusMiles)
             }
-            return
           }
         }
       } catch (e) {
         console.error('Failed to load region from server:', e)
       }
 
-      // Fallback to localStorage
+      // Fallback to localStorage for region
       const saved = localStorage.getItem('monitoringRegion')
       if (saved) {
         try {
@@ -57,10 +56,13 @@ function ConfigScreen({ onClose, onSave }) {
         }
       }
 
-      // Load chime preference
+      // Always load chime preference from localStorage
       const chimePref = localStorage.getItem('chimeEnabled')
       if (chimePref !== null) {
         setChimeEnabled(chimePref === 'true')
+      } else {
+        // Default to false if not set
+        setChimeEnabled(false)
       }
     }
 
