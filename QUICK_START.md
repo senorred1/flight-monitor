@@ -56,8 +56,8 @@ In GitHub secrets, update `VITE_API_URL` with your worker URL.
 3. Select your repository
 4. Build settings:
    - Framework: Vite
-   - Build command: `cd frontend && npm run build`
-   - Output directory: `frontend/dist`
+   - Build command: `npm run build`
+   - Output directory: `dist`
    - Root: `frontend`
 5. Environment variable:
    - `VITE_API_URL` = (your worker URL)

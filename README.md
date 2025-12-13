@@ -159,8 +159,8 @@ npm run deploy
 3. Select your repository
 4. Build settings:
    - Framework preset: Vite
-   - Build command: `cd frontend && npm run build`
-   - Build output directory: `frontend/dist`
+   - Build command: `npm run build`
+   - Build output directory: `dist`
    - Root directory: `frontend`
 5. Environment variables:
    - Add `VITE_API_URL` with your worker URL (e.g., `https://flight-monitor-worker.your-subdomain.workers.dev`)

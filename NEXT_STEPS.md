@@ -75,8 +75,8 @@ npm run deploy
 3. Select your GitHub repository
 4. Configure build:
    - **Framework preset**: Vite
-   - **Build command**: `cd frontend && npm run build`
-   - **Build output directory**: `frontend/dist`
+   - **Build command**: `npm run build`
+   - **Build output directory**: `dist`
    - **Root directory**: `frontend`
 5. Add environment variable:
    - **Variable name**: `VITE_API_URL`
