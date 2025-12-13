@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.DS_Store
+.env
+.env.local
+*.log
+
+# Cloudflare
+.wrangler/
+worker/dist/
+
+# Frontend
+frontend/dist/
+frontend/node_modules/
+

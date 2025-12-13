@@ -1,0 +1,15 @@
+{
+  "name": "flight-tracker",
+  "version": "1.0.0",
+  "description": "Simple flight tracker for iPad with polygon region detection",
+  "scripts": {
+    "dev:frontend": "cd frontend && npm run dev",
+    "build:frontend": "cd frontend && npm run build",
+    "dev:worker": "cd worker && npm run dev",
+    "deploy:worker": "cd worker && npm run deploy"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
+
