@@ -202,6 +202,54 @@
   line-height: 1.4;
 }
 
+.rate-limit-setting {
+  margin-top: 2rem;
+  padding-top: 2rem;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.rate-limit-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.rate-limit-label {
+  color: #ffffff;
+  font-size: 1.1rem;
+  font-weight: 500;
+}
+
+.rate-limit-dropdown {
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
+  color: #ffffff;
+  font-size: 1rem;
+  font-family: inherit;
+  cursor: pointer;
+  transition: border-color 0.2s, background 0.2s;
+  max-width: 200px;
+}
+
+.rate-limit-dropdown:focus {
+  outline: none;
+  border-color: #4a9eff;
+  background: rgba(0, 0, 0, 0.4);
+}
+
+.rate-limit-dropdown option {
+  background: #1e3a5f;
+  color: #ffffff;
+}
+
+.rate-limit-description {
+  font-size: 0.9rem;
+  color: #a0a0a0;
+  line-height: 1.4;
+}
+
 .input-field {
   display: flex;
   flex-direction: column;

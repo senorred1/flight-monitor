@@ -8,6 +8,7 @@ dist/
 # Cloudflare
 .wrangler/
 worker/dist/
+worker/.dev.vars
 
 # Frontend
 frontend/dist/
