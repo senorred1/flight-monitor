@@ -43,11 +43,13 @@ npm install
 
 1. **OpenSky API Credentials** (for production):
    - Sign up at https://openskynetwork.org/
+   - Log in to your OpenSky account and visit the Account page
+   - Create a new API client and retrieve your `client_id` and `client_secret`
    - Add credentials to Cloudflare Workers secrets:
      ```bash
      cd worker
-     wrangler secret put OPENSKY_USERNAME
-     wrangler secret put OPENSKY_PASSWORD
+     wrangler secret put OPENSKY_CLIENT_ID
+     wrangler secret put OPENSKY_CLIENT_SECRET
      ```
 
 2. **Monitoring Region**:
@@ -184,10 +186,12 @@ npx wrangler pages deploy dist --project-name=flight-monitor
    - Or update in GitHub secrets if using Actions
 
 2. **Configure OpenSky Credentials** (if using real API):
+   - Log in to your OpenSky account and visit the Account page
+   - Create a new API client and retrieve your `client_id` and `client_secret`
    ```bash
    cd worker
-   wrangler secret put OPENSKY_USERNAME
-   wrangler secret put OPENSKY_PASSWORD
+   wrangler secret put OPENSKY_CLIENT_ID
+   wrangler secret put OPENSKY_CLIENT_SECRET
    ```
 
 3. **Test the deployment**:

@@ -5,16 +5,19 @@ const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8787'
 
 // Default center point (Phoenix area)
 const DEFAULT_CENTER = {
-  lat: 33.481252177897346,
-  lon: -111.70670272771451
+  lat: 33.47582267755572,
+  lon: -111.70391851974681
 }
 
-const RADIUS_OPTIONS = [1, 2, 3, 5]
+const RADIUS_OPTIONS = [0.5, 1, 2, 3, 5]
+const RATE_LIMIT_OPTIONS = [5, 15, 30] // in seconds
 
 function ConfigScreen({ onClose, onSave }) {
   const [center, setCenter] = useState(DEFAULT_CENTER)
   const [radiusMiles, setRadiusMiles] = useState(3)
   const [chimeEnabled, setChimeEnabled] = useState(false)
+  const [estimatePositions, setEstimatePositions] = useState(true)
+  const [rateLimitSeconds, setRateLimitSeconds] = useState(30)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState(null)
   const [success, setSuccess] = useState(false)
@@ -31,7 +34,7 @@ function ConfigScreen({ onClose, onSave }) {
               lat: data.region.center.lat,
               lon: data.region.center.lon
             })
-            if (data.region.radiusMiles && RADIUS_OPTIONS.includes(data.region.radiusMiles)) {
+            if (data.region.radiusMiles !== undefined && RADIUS_OPTIONS.includes(data.region.radiusMiles)) {
               setRadiusMiles(data.region.radiusMiles)
             }
           }
@@ -48,7 +51,7 @@ function ConfigScreen({ onClose, onSave }) {
           if (parsed.lat && parsed.lon) {
             setCenter(parsed)
           }
-          if (parsed.radiusMiles && RADIUS_OPTIONS.includes(parsed.radiusMiles)) {
+          if (parsed.radiusMiles !== undefined && RADIUS_OPTIONS.includes(parsed.radiusMiles)) {
             setRadiusMiles(parsed.radiusMiles)
           }
         } catch (e) {
@@ -63,6 +66,40 @@ function ConfigScreen({ onClose, onSave }) {
       } else {
         // Default to false if not set
         setChimeEnabled(false)
+      }
+
+      // Load estimate positions preference from localStorage
+      const estimatePref = localStorage.getItem('estimatePositions')
+      if (estimatePref !== null) {
+        setEstimatePositions(estimatePref === 'true')
+      } else {
+        // Default to true if not set
+        setEstimatePositions(true)
+      }
+
+      // Load rate limit preference from server first
+      try {
+        const rateLimitResponse = await fetch(`${API_BASE_URL}/api/rate-limit`)
+        if (rateLimitResponse.ok) {
+          const rateLimitData = await rateLimitResponse.json()
+          if (rateLimitData.rateLimitSeconds && RATE_LIMIT_OPTIONS.includes(rateLimitData.rateLimitSeconds)) {
+            setRateLimitSeconds(rateLimitData.rateLimitSeconds)
+          }
+        }
+      } catch (e) {
+        console.error('Failed to load rate limit from server:', e)
+      }
+
+      // Fallback to localStorage for rate limit
+      const rateLimitPref = localStorage.getItem('rateLimitSeconds')
+      if (rateLimitPref !== null) {
+        const parsed = parseInt(rateLimitPref, 10)
+        if (RATE_LIMIT_OPTIONS.includes(parsed)) {
+          setRateLimitSeconds(parsed)
+        }
+      } else {
+        // Default to 30 seconds if not set
+        setRateLimitSeconds(30)
       }
     }
 
@@ -94,7 +131,7 @@ function ConfigScreen({ onClose, onSave }) {
 
     try {
       // Save to backend
-      const response = await fetch(`${API_BASE_URL}/api/region`, {
+      const regionResponse = await fetch(`${API_BASE_URL}/api/region`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -105,17 +142,34 @@ function ConfigScreen({ onClose, onSave }) {
         })
       })
 
-      if (!response.ok) {
+      if (!regionResponse.ok) {
         throw new Error('Failed to save region to server')
+      }
+
+      // Save rate limit to backend
+      const rateLimitResponse = await fetch(`${API_BASE_URL}/api/rate-limit`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ 
+          rateLimitSeconds: rateLimitSeconds
+        })
+      })
+
+      if (!rateLimitResponse.ok) {
+        console.warn('Failed to save rate limit to server, but continuing...')
       }
 
       // Save to localStorage
       localStorage.setItem('monitoringRegion', JSON.stringify({ ...center, radiusMiles }))
       localStorage.setItem('chimeEnabled', chimeEnabled.toString())
+      localStorage.setItem('estimatePositions', estimatePositions.toString())
+      localStorage.setItem('rateLimitSeconds', rateLimitSeconds.toString())
       
       setSuccess(true)
       if (onSave) {
-        onSave({ center, radiusMiles, chimeEnabled })
+        onSave({ center, radiusMiles, chimeEnabled, estimatePositions, rateLimitSeconds })
       }
       
       // Close after a short delay
@@ -137,14 +191,14 @@ function ConfigScreen({ onClose, onSave }) {
   }
 
   const handleRadiusChange = (e) => {
-    setRadiusMiles(parseInt(e.target.value))
+    setRadiusMiles(parseFloat(e.target.value))
     setError(null)
     setSuccess(false)
   }
 
   return (
     <div className="config-overlay" onClick={onClose}>
-      <div className="config-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="config-modal" onClick={(e) => e.stopPropagation()}>
         <div className="config-header">
           <h2>Monitoring Region</h2>
           <button className="close-button" onClick={onClose}>×</button>
@@ -189,7 +243,7 @@ function ConfigScreen({ onClose, onSave }) {
               >
                 {RADIUS_OPTIONS.map(radius => (
                   <option key={radius} value={radius}>
-                    {radius} {radius === 1 ? 'mile' : 'miles'}
+                    {radius === 0.5 ? '1/2 mile' : radius === 1 ? '1 mile' : `${radius} miles`}
                   </option>
                 ))}
               </select>
@@ -213,6 +267,51 @@ function ConfigScreen({ onClose, onSave }) {
               </label>
               <p className="chime-description">
                 Play a sound notification when a new aircraft enters the monitoring region
+              </p>
+            </div>
+          </div>
+
+          <div className="chime-setting">
+            <div className="chime-toggle-group">
+              <label className="chime-label">
+                <input
+                  type="checkbox"
+                  checked={estimatePositions}
+                  onChange={(e) => {
+                    setEstimatePositions(e.target.checked)
+                    setError(null)
+                    setSuccess(false)
+                  }}
+                  className="chime-checkbox"
+                />
+                <span className="chime-label-text">Estimate plane positions</span>
+              </label>
+              <p className="chime-description">
+                Smoothly animate plane movement between position updates
+              </p>
+            </div>
+          </div>
+
+          <div className="rate-limit-setting">
+            <div className="rate-limit-group">
+              <label className="rate-limit-label">API Rate Limit:</label>
+              <select
+                className="rate-limit-dropdown"
+                value={rateLimitSeconds}
+                onChange={(e) => {
+                  setRateLimitSeconds(parseInt(e.target.value, 10))
+                  setError(null)
+                  setSuccess(false)
+                }}
+              >
+                {RATE_LIMIT_OPTIONS.map(seconds => (
+                  <option key={seconds} value={seconds}>
+                    {seconds} seconds
+                  </option>
+                ))}
+              </select>
+              <p className="rate-limit-description">
+                Minimum time between API calls to OpenSky. Lower values provide more frequent updates but may hit rate limits.
               </p>
             </div>
           </div>

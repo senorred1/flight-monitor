@@ -106,19 +106,27 @@ The GitHub Action will deploy on push, but you need to set up the Pages project 
 
 If you want to use real flight data instead of synthetic:
 
+1. **Get OAuth2 Credentials**:
+   - Log in to your OpenSky account at https://openskynetwork.org/
+   - Visit the Account page
+   - Create a new API client and retrieve your `client_id` and `client_secret`
+
+2. **Set Cloudflare Secrets**:
 ```bash
 cd worker
 
-# Set your OpenSky credentials
-npx wrangler secret put OPENSKY_USERNAME
-# Enter your username when prompted
+# Set your OpenSky OAuth2 credentials
+npx wrangler secret put OPENSKY_CLIENT_ID
+# Enter your client_id when prompted
 
-npx wrangler secret put OPENSKY_PASSWORD
-# Enter your password when prompted
+npx wrangler secret put OPENSKY_CLIENT_SECRET
+# Enter your client_secret when prompted
 
 # Update worker code
 # Set USE_SYNTHETIC_DATA = false in worker/src/index.js
 ```
+
+**Note**: The app uses OAuth2 client credentials flow. Tokens are automatically cached and refreshed every 30 minutes.
 
 Then redeploy:
 ```bash

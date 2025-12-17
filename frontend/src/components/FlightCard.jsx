@@ -8,8 +8,59 @@ function FlightCard({ flight }) {
       <div className="card-content">
         <div className="card-header">
           <div className="aircraft-icon">✈️</div>
-          <h1 className="tail-number">{flight.callsign || flight.icao24 || 'N/A'}</h1>
+          <h1 className="tail-number">{flight.registration || flight.callsign || flight.icao24 || 'N/A'}</h1>
+          {flight.callsign && flight.callsign !== (flight.registration || flight.icao24) && (
+            <div className="callsign-subtitle">{flight.callsign}</div>
+          )}
         </div>
+        
+        {/* Aircraft Information Section */}
+        {(flight.registration || flight.aircraftType || flight.manufacturer || flight.model || flight.owner || flight.operator) && (
+          <>
+            <div className="aircraft-details">
+              <h2 className="section-title">Aircraft Details</h2>
+              {flight.registration && (
+                <div className="info-row">
+                  <div className="info-label">Registration</div>
+                  <div className="info-value">{flight.registration}</div>
+                </div>
+              )}
+              {flight.aircraftType && (
+                <div className="info-row">
+                  <div className="info-label">Type</div>
+                  <div className="info-value">{flight.aircraftType}</div>
+                </div>
+              )}
+              {(flight.manufacturer || flight.model) && (
+                <div className="info-row">
+                  <div className="info-label">Aircraft</div>
+                  <div className="info-value">
+                    {[flight.manufacturer, flight.model].filter(Boolean).join(' ')}
+                  </div>
+                </div>
+              )}
+              {flight.owner && (
+                <div className="info-row">
+                  <div className="info-label">Owner</div>
+                  <div className="info-value">{flight.owner}</div>
+                </div>
+              )}
+              {flight.operator && flight.operator !== flight.owner && (
+                <div className="info-row">
+                  <div className="info-label">Operator</div>
+                  <div className="info-value">{flight.operator}</div>
+                </div>
+              )}
+              {flight.built && (
+                <div className="info-row">
+                  <div className="info-label">Year Built</div>
+                  <div className="info-value">{flight.built}</div>
+                </div>
+              )}
+            </div>
+            <div className="info-divider"></div>
+          </>
+        )}
         
         <div className="flight-info">
           <div className="info-row">

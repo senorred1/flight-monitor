@@ -1,12 +1,22 @@
 // Rate limiting: Track last API call time
 let lastApiCall = 0
-const API_CALL_INTERVAL = 30000 // 30 seconds in milliseconds
+let lastMapChangeApiCall = 0
+let API_CALL_INTERVAL = 30000 // 30 seconds in milliseconds (normal polling) - configurable
+const MAP_CHANGE_API_INTERVAL = 3000 // 3 seconds in milliseconds (map zoom/pan changes)
+
+// OAuth2 token cache (in-memory)
+let tokenCache = {
+  token: null,
+  expiresAt: 0 // Timestamp when token expires
+}
+const TOKEN_EXPIRY_BUFFER = 5 * 60 * 1000 // Refresh token 5 minutes before expiry (in milliseconds)
+const TOKEN_EXPIRY_TIME = 30 * 60 * 1000 // Tokens expire after 30 minutes (in milliseconds)
 
 // Default monitoring region (Phoenix area)
 const DEFAULT_REGION = {
   center: {
-    lat: 33.481252177897346,
-    lon: -111.70670272771451
+    lat: 33.47582267755572,
+    lon: -111.70391851974681
   },
   radiusMiles: 3
 }
@@ -14,8 +24,23 @@ const DEFAULT_REGION = {
 // Store monitoring region in memory (in production, use Cloudflare KV or Durable Objects)
 let MONITORING_REGION = DEFAULT_REGION
 
+// Cache last successful flights data for map display (to prevent disappearing during rate limits)
+let lastFlightsCache = {
+  flights: [],
+  timestamp: 0,
+  bounds: null
+}
+const FLIGHTS_CACHE_MAX_AGE = 30 * 1000 // Cache flights for up to 30 seconds
+
+// Aircraft database cache (loaded from R2)
+let aircraftDbCache = {
+  data: null,
+  timestamp: 0
+}
+const AIRCRAFT_DB_CACHE_MAX_AGE = 24 * 60 * 60 * 1000 // Cache for 24 hours
+
 // Test mode flag - set to false when ready to use real OpenSky API
-const USE_SYNTHETIC_DATA = true
+const USE_SYNTHETIC_DATA = false
 
 // Synthetic flight data for testing (Phoenix area)
 const SYNTHETIC_FLIGHTS = [
@@ -24,8 +49,8 @@ const SYNTHETIC_FLIGHTS = [
     callsign: 'TEST01',
     origin: 'KPHX',
     destination: 'KLAX',
-    latitude: 33.481252177897346,
-    longitude: -111.70670272771451,
+    latitude: 33.47582267755572,
+    longitude: -111.70391851974681,
     baroAltitude: 35000,
     velocity: 250, // m/s (~560 mph)
     heading: 180, // degrees (south)
@@ -63,38 +88,289 @@ function isPointInRegion(latitude, longitude, region) {
 }
 
 /**
- * Fetch flight data from OpenSky API
+ * Get OAuth2 access token from OpenSky authentication server
+ * Uses client credentials flow and caches the token in memory
  */
-async function fetchOpenSkyData(username, password) {
+async function getAccessToken(clientId, clientSecret) {
   const now = Date.now()
   
+  // Check if we have a valid token (not expired and not within buffer time)
+  if (tokenCache.token && tokenCache.expiresAt > (now + TOKEN_EXPIRY_BUFFER)) {
+    return tokenCache.token
+  }
+
+  // Token expired or doesn't exist, fetch a new one
+  try {
+    console.log('Fetching new OAuth2 access token from OpenSky...')
+    
+    const tokenUrl = 'https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token'
+    const params = new URLSearchParams({
+      grant_type: 'client_credentials',
+      client_id: clientId,
+      client_secret: clientSecret
+    })
+
+    const response = await fetch(tokenUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded'
+      },
+      body: params.toString()
+    })
+
+    if (!response.ok) {
+      const errorText = await response.text()
+      console.error(`OAuth2 token error: ${response.status} ${response.statusText}`, errorText)
+      throw new Error(`Failed to obtain OAuth2 token: ${response.status} ${response.statusText}`)
+    }
+
+    const data = await response.json()
+    const accessToken = data.access_token
+
+    if (!accessToken) {
+      throw new Error('No access_token in OAuth2 response')
+    }
+
+    // Cache the token with expiration time
+    tokenCache.token = accessToken
+    tokenCache.expiresAt = now + TOKEN_EXPIRY_TIME
+
+    console.log('OAuth2 token obtained and cached')
+    return accessToken
+  } catch (error) {
+    console.error('Error obtaining OAuth2 token:', error.message || error)
+    // Clear invalid cache
+    tokenCache.token = null
+    tokenCache.expiresAt = 0
+    throw error
+  }
+}
+
+/**
+ * Fetch flight data from OpenSky API using OAuth2 Bearer token
+ * @param {string} clientId - OAuth2 client ID
+ * @param {string} clientSecret - OAuth2 client secret
+ * @param {boolean} isMapChange - Whether this is triggered by a map zoom/pan change
+ */
+async function fetchOpenSkyData(clientId, clientSecret, isMapChange = false) {
+  const now = Date.now()
+  
+  // Use different rate limits based on whether this is a map change
+  const rateLimitInterval = isMapChange ? MAP_CHANGE_API_INTERVAL : API_CALL_INTERVAL
+  const lastCallTime = isMapChange ? lastMapChangeApiCall : lastApiCall
+  
   // Rate limiting check
-  if (now - lastApiCall < API_CALL_INTERVAL) {
-    console.log('Rate limit: Skipping API call')
+  if (now - lastCallTime < rateLimitInterval) {
+    const timeSince = Math.round((now - lastCallTime) / 1000)
+    console.log(`Rate limit: Skipping API call (last ${isMapChange ? 'map change' : 'normal'} call was ${timeSince} seconds ago)`)
     return null
   }
 
   try {
-    const url = 'https://opensky-network.org/api/states/all'
-    const auth = btoa(`${username}:${password}`)
+    // Get access token (will use cached token if valid)
+    const accessToken = await getAccessToken(clientId, clientSecret)
     
+    const url = 'https://opensky-network.org/api/states/all'
+    
+    console.log('Fetching OpenSky data...')
     const response = await fetch(url, {
       headers: {
-        'Authorization': `Basic ${auth}`
+        'Authorization': `Bearer ${accessToken}`
       }
     })
 
+    // Always update appropriate lastApiCall to enforce rate limiting, even on errors
+    if (isMapChange) {
+      lastMapChangeApiCall = now
+    } else {
+      lastApiCall = now
+    }
+
     if (!response.ok) {
-      throw new Error(`OpenSky API error: ${response.status}`)
+      const errorText = await response.text()
+      console.error(`OpenSky API error: ${response.status} ${response.statusText}`, errorText)
+      
+      // For unauthorized (401), try refreshing token and retry once
+      if (response.status === 401) {
+        console.log('Token expired or invalid, refreshing token and retrying...')
+        // Clear cache to force token refresh
+        tokenCache.token = null
+        tokenCache.expiresAt = 0
+        
+        // Get a new token
+        const newToken = await getAccessToken(clientId, clientSecret)
+        
+        // Retry the request with new token
+        const retryResponse = await fetch(url, {
+          headers: {
+            'Authorization': `Bearer ${newToken}`
+          }
+        })
+
+        if (!retryResponse.ok) {
+          const retryErrorText = await retryResponse.text()
+          console.error(`OpenSky API retry error: ${retryResponse.status} ${retryResponse.statusText}`, retryErrorText)
+          throw new Error(`OpenSky API error after token refresh: ${retryResponse.status} ${retryResponse.statusText}`)
+        }
+
+        const data = await retryResponse.json()
+        const flightCount = data.states ? data.states.length : 0
+        console.log(`OpenSky API returned ${flightCount} flights (after token refresh)`)
+        return data.states || []
+      }
+      
+      throw new Error(`OpenSky API error: ${response.status} ${response.statusText}`)
     }
 
     const data = await response.json()
-    lastApiCall = now
+    const flightCount = data.states ? data.states.length : 0
+    console.log(`OpenSky API returned ${flightCount} flights`)
     return data.states || []
   } catch (error) {
-    console.error('Error fetching OpenSky data:', error)
+    console.error('Error fetching OpenSky data:', error.message || error)
+    // lastApiCall already updated above, so rate limiting will work
     return null
   }
+}
+
+/**
+ * Load aircraft database from R2 storage
+ * @param {Object} r2Bucket - R2 bucket binding
+ * @returns {Promise<Object|null>} - Aircraft database object keyed by icao24, or null if error
+ */
+async function loadAircraftDatabase(r2Bucket) {
+  const now = Date.now()
+  
+  // Check if we have a valid cached database
+  if (aircraftDbCache.data && (now - aircraftDbCache.timestamp) < AIRCRAFT_DB_CACHE_MAX_AGE) {
+    return aircraftDbCache.data
+  }
+  
+  if (!r2Bucket) {
+    console.log('R2 bucket not available, skipping aircraft database load')
+    return null
+  }
+  
+  try {
+    console.log('Loading aircraft database from R2...')
+    console.log(`R2 bucket type: ${typeof r2Bucket}, has get method: ${typeof r2Bucket?.get}`)
+    
+    // Try to get the compressed database file
+    const objectKey = 'aircraft-db.json.gz'
+    console.log(`Attempting to fetch object with key: "${objectKey}"`)
+    
+    const object = await r2Bucket.get(objectKey)
+    
+    if (!object) {
+      console.log(`❌ Aircraft database not found in R2 (key: "${objectKey}")`)
+      console.log('💡 To fix this, run: npm run sync-aircraft-db')
+      console.log('   This will download and upload the aircraft database to R2')
+      
+      // Try alternative keys in case the file was uploaded with a different name
+      const testKeys = ['aircraft-db.json', 'aircraft_db.json.gz']
+      for (const testKey of testKeys) {
+        try {
+          const testObject = await r2Bucket.get(testKey)
+          if (testObject) {
+            console.log(`✅ Found object with alternative key: "${testKey}"`)
+            // Use the found object
+            const compressedData = await testObject.arrayBuffer()
+            const decompressedData = await decompressGzip(compressedData)
+            const jsonText = new TextDecoder().decode(decompressedData)
+            const aircraftDb = JSON.parse(jsonText)
+            
+            aircraftDbCache.data = aircraftDb
+            aircraftDbCache.timestamp = now
+            
+            console.log(`✅ Aircraft database loaded: ${Object.keys(aircraftDb).length} entries`)
+            return aircraftDb
+          }
+        } catch (testError) {
+          // Continue to next key
+        }
+      }
+      
+      return null
+    }
+    
+    // Decompress the gzipped data
+    const compressedData = await object.arrayBuffer()
+    const decompressedData = await decompressGzip(compressedData)
+    const jsonText = new TextDecoder().decode(decompressedData)
+    const aircraftDb = JSON.parse(jsonText)
+    
+    // Cache the database
+    aircraftDbCache.data = aircraftDb
+    aircraftDbCache.timestamp = now
+    
+    console.log(`Aircraft database loaded: ${Object.keys(aircraftDb).length} entries`)
+    return aircraftDb
+  } catch (error) {
+    console.error('Error loading aircraft database:', error.message || error)
+    return null
+  }
+}
+
+/**
+ * Decompress gzip data
+ * @param {ArrayBuffer} compressedData - Gzipped data
+ * @returns {Promise<Uint8Array>} - Decompressed data
+ */
+async function decompressGzip(compressedData) {
+  // Use the built-in DecompressionStream API (available in Cloudflare Workers)
+  const stream = new DecompressionStream('gzip')
+  const writer = stream.writable.getWriter()
+  const reader = stream.readable.getReader()
+  
+  // Write the compressed data
+  await writer.write(compressedData)
+  await writer.close()
+  
+  // Read all chunks
+  const chunks = []
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    if (value) {
+      chunks.push(value)
+    }
+  }
+  
+  // Combine chunks into a single Uint8Array
+  if (chunks.length === 0) {
+    return new Uint8Array(0)
+  }
+  
+  if (chunks.length === 1) {
+    return new Uint8Array(chunks[0])
+  }
+  
+  // Multiple chunks - combine them
+  const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0)
+  const result = new Uint8Array(totalLength)
+  let offset = 0
+  for (const chunk of chunks) {
+    result.set(chunk, offset)
+    offset += chunk.length
+  }
+  
+  return result
+}
+
+/**
+ * Get aircraft information from database by ICAO24
+ * @param {Object} aircraftDb - Aircraft database object
+ * @param {string} icao24 - ICAO24 address
+ * @returns {Object|null} - Aircraft information or null if not found
+ */
+function getAircraftInfo(aircraftDb, icao24) {
+  if (!aircraftDb || !icao24) {
+    return null
+  }
+  
+  // Normalize icao24 to lowercase for lookup
+  const normalizedIcao24 = icao24.toLowerCase()
+  return aircraftDb[normalizedIcao24] || null
 }
 
 /**
@@ -111,8 +387,10 @@ function getAirportInfo(icao24, callsign) {
 
 /**
  * Process flight states and check if any are in the monitoring region
+ * @param {Array} flights - Array of flight state arrays from OpenSky
+ * @param {Object} aircraftDb - Aircraft database object (optional)
  */
-function processFlights(flights) {
+function processFlights(flights, aircraftDb = null) {
   if (!flights || flights.length === 0) {
     return null
   }
@@ -125,14 +403,25 @@ function processFlights(flights) {
     
     const latitude = flight[6]
     const longitude = flight[5]
+    const onGround = flight[8] // on_ground flag
+    
+    // Skip aircraft that are on the ground
+    if (onGround === true) {
+      continue
+    }
     
     if (latitude && longitude) {
       const inRegion = isPointInRegion(latitude, longitude, MONITORING_REGION)
       
       if (inRegion) {
         const airportInfo = getAirportInfo(flight[0], flight[1])
-        return {
-          icao24: flight[0],
+        const icao24 = flight[0]
+        
+        // Enrich with aircraft database information
+        const aircraftInfo = aircraftDb ? getAircraftInfo(aircraftDb, icao24) : null
+        
+        const flightData = {
+          icao24: icao24,
           callsign: flight[1] || null,
           origin: airportInfo.origin,
           destination: airportInfo.destination,
@@ -144,11 +433,123 @@ function processFlights(flights) {
           verticalRate: flight[11], // m/s
           inRegion: true
         }
+        
+        // Add aircraft database fields if available
+        if (aircraftInfo) {
+          if (aircraftInfo.registration) flightData.registration = aircraftInfo.registration
+          if (aircraftInfo.typecode) flightData.aircraftType = aircraftInfo.typecode
+          if (aircraftInfo.owner) flightData.owner = aircraftInfo.owner
+          if (aircraftInfo.operator) flightData.operator = aircraftInfo.operator
+          if (aircraftInfo.manufacturerName) flightData.manufacturer = aircraftInfo.manufacturerName
+          if (aircraftInfo.model) flightData.model = aircraftInfo.model
+          if (aircraftInfo.serialNumber) flightData.serialNumber = aircraftInfo.serialNumber
+          if (aircraftInfo.operatorCallsign) flightData.operatorCallsign = aircraftInfo.operatorCallsign
+          if (aircraftInfo.built) flightData.built = aircraftInfo.built
+        }
+        
+        return flightData
       }
     }
   }
 
   return null
+}
+
+/**
+ * Check if a point is within map bounds
+ */
+function isPointInBounds(latitude, longitude, bounds) {
+  if (!bounds || !bounds.north || !bounds.south || !bounds.east || !bounds.west) {
+    return false
+  }
+  
+  // Handle longitude wrapping (east might be less than west if crossing 180/-180)
+  const lonInBounds = bounds.west <= bounds.east
+    ? (longitude >= bounds.west && longitude <= bounds.east)
+    : (longitude >= bounds.west || longitude <= bounds.east)
+  
+  return latitude >= bounds.south && latitude <= bounds.north && lonInBounds
+}
+
+/**
+ * Process flight states and return up to maxFlights that are within the map bounds
+ * @param {Array} flights - Array of flight state arrays from OpenSky
+ * @param {number} maxFlights - Maximum number of flights to return
+ * @param {Object} bounds - Map bounds object {minLat, maxLat, minLon, maxLon}
+ * @param {Object} aircraftDb - Aircraft database object (optional)
+ */
+function processMultipleFlights(flights, maxFlights = 10, bounds = null, aircraftDb = null) {
+  if (!flights || flights.length === 0) {
+    return []
+  }
+
+  const flightsInBounds = []
+
+  for (const flight of flights) {
+    // Flight state format from OpenSky:
+    // [icao24, callsign, origin_country, time_position, last_contact, longitude, latitude, 
+    //  baro_altitude, on_ground, velocity, heading, vertical_rate, sensors, geo_altitude, 
+    //  squawk, spi, position_source]
+    
+    const latitude = flight[6]
+    const longitude = flight[5]
+    const onGround = flight[8] // on_ground flag
+    
+    // Skip aircraft that are on the ground
+    if (onGround === true) {
+      continue
+    }
+    
+    if (latitude && longitude) {
+      // If bounds provided, check bounds; otherwise check monitoring region
+      const inArea = bounds 
+        ? isPointInBounds(latitude, longitude, bounds)
+        : isPointInRegion(latitude, longitude, MONITORING_REGION)
+      
+      if (inArea) {
+        const airportInfo = getAirportInfo(flight[0], flight[1])
+        const icao24 = flight[0]
+        
+        // Enrich with aircraft database information
+        const aircraftInfo = aircraftDb ? getAircraftInfo(aircraftDb, icao24) : null
+        
+        const flightData = {
+          icao24: icao24,
+          callsign: flight[1] || null,
+          origin: airportInfo.origin,
+          destination: airportInfo.destination,
+          latitude,
+          longitude,
+          baroAltitude: flight[7],
+          velocity: flight[9], // m/s
+          heading: flight[10], // degrees
+          verticalRate: flight[11], // m/s
+          inRegion: !bounds || isPointInRegion(latitude, longitude, MONITORING_REGION)
+        }
+        
+        // Add aircraft database fields if available
+        if (aircraftInfo) {
+          if (aircraftInfo.registration) flightData.registration = aircraftInfo.registration
+          if (aircraftInfo.typecode) flightData.aircraftType = aircraftInfo.typecode
+          if (aircraftInfo.owner) flightData.owner = aircraftInfo.owner
+          if (aircraftInfo.operator) flightData.operator = aircraftInfo.operator
+          if (aircraftInfo.manufacturerName) flightData.manufacturer = aircraftInfo.manufacturerName
+          if (aircraftInfo.model) flightData.model = aircraftInfo.model
+          if (aircraftInfo.serialNumber) flightData.serialNumber = aircraftInfo.serialNumber
+          if (aircraftInfo.operatorCallsign) flightData.operatorCallsign = aircraftInfo.operatorCallsign
+          if (aircraftInfo.built) flightData.built = aircraftInfo.built
+        }
+        
+        flightsInBounds.push(flightData)
+
+        if (flightsInBounds.length >= maxFlights) {
+          break
+        }
+      }
+    }
+  }
+
+  return flightsInBounds
 }
 
 /**
@@ -192,6 +593,63 @@ function getSyntheticFlight() {
   return null
 }
 
+/**
+ * Generate multiple synthetic flights for map display (up to maxFlights)
+ */
+function getSyntheticFlights(maxFlights = 10, bounds = null) {
+  const flights = []
+  
+  let minLat, maxLat, minLon, maxLon
+  
+  if (bounds) {
+    // Use map bounds
+    minLat = bounds.south
+    maxLat = bounds.north
+    minLon = bounds.west
+    maxLon = bounds.east
+  } else {
+    // Fallback to monitoring region
+    const center = MONITORING_REGION.center
+    const radiusMiles = MONITORING_REGION.radiusMiles
+    // Approximate bounds from center and radius
+    const latOffset = radiusMiles / 69
+    const lonOffset = radiusMiles / (69 * Math.cos(center.lat * Math.PI / 180))
+    minLat = center.lat - latOffset
+    maxLat = center.lat + latOffset
+    minLon = center.lon - lonOffset
+    maxLon = center.lon + lonOffset
+  }
+  
+  // Generate 1-10 synthetic flights
+  const numFlights = Math.floor(Math.random() * maxFlights) + 1
+  
+  for (let i = 0; i < numFlights; i++) {
+    // Generate random position within bounds
+    const randomLat = minLat + Math.random() * (maxLat - minLat)
+    const randomLon = minLon + Math.random() * (maxLon - minLon)
+    
+    // Check if in monitoring region
+    const inRegion = isPointInRegion(randomLat, randomLon, MONITORING_REGION)
+    
+    // Add some variation to flight data
+    flights.push({
+      icao24: `abc${String(i + 1).padStart(3, '0')}`,
+      callsign: `TEST${String(i + 1).padStart(2, '0')}`,
+      origin: 'KPHX',
+      destination: 'KLAX',
+      latitude: randomLat,
+      longitude: randomLon,
+      baroAltitude: 30000 + Math.random() * 10000,
+      velocity: 200 + Math.random() * 100, // m/s
+      heading: Math.random() * 360, // degrees
+      verticalRate: (Math.random() - 0.5) * 10, // m/s
+      inRegion: inRegion
+    })
+  }
+  
+  return flights
+}
+
 export default {
   async fetch(request, env) {
     // Handle CORS
@@ -223,6 +681,135 @@ export default {
         }
       )
     }
+
+    // Debug endpoint to test R2 access
+    if (url.pathname === '/api/debug-r2') {
+      const debugInfo = {
+        hasR2Binding: !!env.AIRCRAFT_DB,
+        r2BindingType: typeof env.AIRCRAFT_DB,
+        cacheStatus: {
+          hasCachedData: !!aircraftDbCache.data,
+          cacheTimestamp: aircraftDbCache.timestamp ? new Date(aircraftDbCache.timestamp).toISOString() : null,
+          cacheAge: aircraftDbCache.timestamp ? Math.round((Date.now() - aircraftDbCache.timestamp) / 1000) : null,
+          cacheEntryCount: aircraftDbCache.data ? Object.keys(aircraftDbCache.data).length : 0
+        }
+      }
+
+      if (env.AIRCRAFT_DB) {
+        try {
+          // Try to access R2 directly
+          const objectKey = 'aircraft-db.json.gz'
+          debugInfo.r2Access = {
+            objectKey: objectKey,
+            attemptingFetch: true
+          }
+          
+          const object = await env.AIRCRAFT_DB.get(objectKey)
+          debugInfo.r2Access.objectExists = !!object
+          
+          if (object) {
+            debugInfo.r2Access.objectSize = object.size
+            debugInfo.r2Access.objectLastModified = object.uploaded ? new Date(object.uploaded).toISOString() : null
+            debugInfo.r2Access.objectEtag = object.etag || null
+            
+            // Try to load the database
+            const aircraftDb = await loadAircraftDatabase(env.AIRCRAFT_DB)
+            debugInfo.loadTest = {
+              success: !!aircraftDb,
+              entryCount: aircraftDb ? Object.keys(aircraftDb).length : 0,
+              sampleEntries: aircraftDb ? Object.keys(aircraftDb).slice(0, 3).map(key => ({
+                icao24: key,
+                data: aircraftDb[key]
+              })) : null
+            }
+          } else {
+            // Try alternative keys
+            const alternativeKeys = ['aircraft-db.json', 'aircraft_db.json.gz']
+            debugInfo.alternativeKeys = {}
+            for (const altKey of alternativeKeys) {
+              const altObject = await env.AIRCRAFT_DB.get(altKey)
+              debugInfo.alternativeKeys[altKey] = !!altObject
+              if (altObject) {
+                debugInfo.alternativeKeys[`${altKey}_size`] = altObject.size
+              }
+            }
+          }
+        } catch (error) {
+          debugInfo.r2Error = {
+            message: error.message,
+            stack: error.stack,
+            name: error.name
+          }
+        }
+      } else {
+        debugInfo.error = 'R2 binding not configured. Check wrangler.toml for [[r2_buckets]] binding.'
+      }
+
+      return new Response(
+        JSON.stringify(debugInfo, null, 2),
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+          },
+        }
+      )
+    }
+
+    // Debug endpoint to test OpenSky API connectivity
+    if (url.pathname === '/api/debug-opensky') {
+      const clientId = env.OPENSKY_CLIENT_ID || ''
+      const clientSecret = env.OPENSKY_CLIENT_SECRET || ''
+      
+      const debugInfo = {
+        hasCredentials: !!(clientId && clientSecret),
+        credentialsLength: {
+          clientId: clientId ? clientId.length : 0,
+          clientSecret: clientSecret ? clientSecret.length : 0
+        },
+        usingSyntheticData: USE_SYNTHETIC_DATA,
+        monitoringRegion: MONITORING_REGION,
+        lastApiCall: lastApiCall,
+        timeSinceLastCall: lastApiCall ? Math.round((Date.now() - lastApiCall) / 1000) : null,
+        rateLimitInterval: API_CALL_INTERVAL / 1000,
+        tokenCache: {
+          hasToken: !!tokenCache.token,
+          expiresAt: tokenCache.expiresAt ? new Date(tokenCache.expiresAt).toISOString() : null,
+          expiresIn: tokenCache.expiresAt ? Math.round((tokenCache.expiresAt - Date.now()) / 1000) : null
+        }
+      }
+
+      if (clientId && clientSecret) {
+        try {
+          const testFlights = await fetchOpenSkyData(clientId, clientSecret)
+          debugInfo.openSkyTest = {
+            success: testFlights !== null,
+            flightCount: testFlights ? testFlights.length : 0,
+            sampleFlight: testFlights && testFlights.length > 0 ? {
+              icao24: testFlights[0][0],
+              callsign: testFlights[0][1],
+              latitude: testFlights[0][6],
+              longitude: testFlights[0][5]
+            } : null
+          }
+        } catch (error) {
+          debugInfo.openSkyTest = {
+            success: false,
+            error: error.message
+          }
+        }
+      }
+
+      return new Response(
+        JSON.stringify(debugInfo, null, 2),
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+          },
+        }
+      )
+    }
     
     // API endpoint to check for flights in region
     if (url.pathname === '/api/check-flights') {
@@ -233,14 +820,19 @@ export default {
         flight = getSyntheticFlight()
       } else {
         // Use real OpenSky API
-        const username = env.OPENSKY_USERNAME || ''
-        const password = env.OPENSKY_PASSWORD || ''
+        const clientId = env.OPENSKY_CLIENT_ID || ''
+        const clientSecret = env.OPENSKY_CLIENT_SECRET || ''
         
-        if (!username || !password) {
+        if (!clientId || !clientSecret) {
+          // Return empty result instead of error when credentials not configured
           return new Response(
-            JSON.stringify({ error: 'OpenSky credentials not configured' }),
+            JSON.stringify({
+              flight: null,
+              timestamp: new Date().toISOString(),
+              usingSyntheticData: false,
+              error: 'OpenSky credentials not configured. Please set OPENSKY_CLIENT_ID and OPENSKY_CLIENT_SECRET secrets.'
+            }),
             {
-              status: 500,
               headers: {
                 'Content-Type': 'application/json',
                 'Access-Control-Allow-Origin': '*',
@@ -249,15 +841,123 @@ export default {
           )
         }
 
-        const flights = await fetchOpenSkyData(username, password)
+        const flights = await fetchOpenSkyData(clientId, clientSecret)
         if (flights) {
-          flight = processFlights(flights)
+          console.log(`Processing ${flights.length} flights from OpenSky`)
+          // Load aircraft database
+          const aircraftDb = await loadAircraftDatabase(env.AIRCRAFT_DB)
+          flight = processFlights(flights, aircraftDb)
+          if (flight) {
+            console.log('Found flight in region:', flight.callsign || flight.icao24)
+          } else {
+            console.log('No flights found in monitoring region')
+          }
+        } else {
+          console.log('No flights data returned from OpenSky (may be rate limited or error)')
         }
       }
 
       return new Response(
         JSON.stringify({
           flight,
+          timestamp: new Date().toISOString(),
+          usingSyntheticData: USE_SYNTHETIC_DATA
+        }),
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+          },
+        }
+      )
+    }
+
+    // API endpoint to get multiple flights for map display (up to 10)
+    if (url.pathname === '/api/map-flights') {
+      let flights = []
+      
+      // Get map bounds from query parameters
+      let bounds = null
+      const north = url.searchParams.get('north')
+      const south = url.searchParams.get('south')
+      const east = url.searchParams.get('east')
+      const west = url.searchParams.get('west')
+      
+      if (north && south && east && west) {
+        bounds = {
+          north: parseFloat(north),
+          south: parseFloat(south),
+          east: parseFloat(east),
+          west: parseFloat(west)
+        }
+      }
+
+      if (USE_SYNTHETIC_DATA) {
+        // Use synthetic data for testing
+        flights = getSyntheticFlights(10, bounds)
+      } else {
+        // Use real OpenSky API
+        const clientId = env.OPENSKY_CLIENT_ID || ''
+        const clientSecret = env.OPENSKY_CLIENT_SECRET || ''
+        
+        if (!clientId || !clientSecret) {
+          // Return empty flights array instead of error when credentials not configured
+          return new Response(
+            JSON.stringify({
+              flights: [],
+              timestamp: new Date().toISOString(),
+              usingSyntheticData: false,
+              error: 'OpenSky credentials not configured. Please set OPENSKY_CLIENT_ID and OPENSKY_CLIENT_SECRET secrets.'
+            }),
+            {
+              headers: {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+              },
+            }
+          )
+        }
+
+        // Check if this is a map change (zoom/pan) request
+        const mapChanged = url.searchParams.get('mapChanged') === 'true'
+        const openSkyFlights = await fetchOpenSkyData(clientId, clientSecret, mapChanged)
+        if (openSkyFlights) {
+          console.log(`Processing ${openSkyFlights.length} flights from OpenSky for map`)
+          // Load aircraft database
+          const aircraftDb = await loadAircraftDatabase(env.AIRCRAFT_DB)
+          flights = processMultipleFlights(openSkyFlights, 50, bounds, aircraftDb)
+          console.log(`Found ${flights.length} flights within map bounds`)
+          
+          // Cache the successful flights response
+          lastFlightsCache = {
+            flights: flights,
+            timestamp: Date.now(),
+            bounds: bounds
+          }
+        } else {
+          console.log('No flights data returned from OpenSky for map (may be rate limited or error)')
+          
+          // If we have cached flights that are still valid, use them
+          const cacheAge = Date.now() - lastFlightsCache.timestamp
+          if (lastFlightsCache.flights.length > 0 && cacheAge < FLIGHTS_CACHE_MAX_AGE) {
+            // Check if bounds are similar (within reasonable range)
+            const boundsMatch = !bounds || !lastFlightsCache.bounds || 
+              (Math.abs(bounds.north - lastFlightsCache.bounds.north) < 1 &&
+               Math.abs(bounds.south - lastFlightsCache.bounds.south) < 1 &&
+               Math.abs(bounds.east - lastFlightsCache.bounds.east) < 1 &&
+               Math.abs(bounds.west - lastFlightsCache.bounds.west) < 1)
+            
+            if (boundsMatch) {
+              console.log(`Using cached flights (${lastFlightsCache.flights.length} flights, ${Math.round(cacheAge / 1000)}s old)`)
+              flights = lastFlightsCache.flights
+            }
+          }
+        }
+      }
+
+      return new Response(
+        JSON.stringify({
+          flights,
           timestamp: new Date().toISOString(),
           usingSyntheticData: USE_SYNTHETIC_DATA
         }),
@@ -356,6 +1056,72 @@ export default {
     if (url.pathname === '/api/region' && request.method === 'GET') {
       return new Response(
         JSON.stringify({ region: MONITORING_REGION }),
+        {
+          headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+          },
+        }
+      )
+    }
+
+    // Endpoint to update rate limit
+    if (url.pathname === '/api/rate-limit' && request.method === 'POST') {
+      try {
+        const body = await request.json()
+        const { rateLimitSeconds } = body
+
+        // Validate rate limit
+        if (typeof rateLimitSeconds !== 'number' || rateLimitSeconds < 1 || rateLimitSeconds > 300) {
+          return new Response(
+            JSON.stringify({ error: 'Invalid rate limit: must be between 1 and 300 seconds' }),
+            {
+              status: 400,
+              headers: {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+              },
+            }
+          )
+        }
+
+        // Update rate limit (convert seconds to milliseconds)
+        API_CALL_INTERVAL = rateLimitSeconds * 1000
+
+        return new Response(
+          JSON.stringify({ 
+            message: 'Rate limit updated successfully',
+            rateLimitSeconds: rateLimitSeconds,
+            rateLimitMilliseconds: API_CALL_INTERVAL
+          }),
+          {
+            headers: {
+              'Content-Type': 'application/json',
+              'Access-Control-Allow-Origin': '*',
+            },
+          }
+        )
+      } catch (err) {
+        return new Response(
+          JSON.stringify({ error: 'Failed to parse request: ' + err.message }),
+          {
+            status: 400,
+            headers: {
+              'Content-Type': 'application/json',
+              'Access-Control-Allow-Origin': '*',
+            },
+          }
+        )
+      }
+    }
+
+    // Endpoint to get current rate limit
+    if (url.pathname === '/api/rate-limit' && request.method === 'GET') {
+      return new Response(
+        JSON.stringify({ 
+          rateLimitSeconds: API_CALL_INTERVAL / 1000,
+          rateLimitMilliseconds: API_CALL_INTERVAL
+        }),
         {
           headers: {
             'Content-Type': 'application/json',

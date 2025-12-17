@@ -6,6 +6,12 @@ compatibility_date = "2024-01-01"
 ip = "0.0.0.0"
 port = 8787
 
+# R2 binding for aircraft database (global - applies to all environments)
+[[r2_buckets]]
+binding = "AIRCRAFT_DB"
+bucket_name = "flight-monitor"
+preview_bucket_name = "flight-monitor"
+
 [env.production]
 vars = { ENVIRONMENT = "production" }
 

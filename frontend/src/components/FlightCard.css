@@ -57,6 +57,28 @@
   margin: 0;
 }
 
+.callsign-subtitle {
+  font-size: 1.2rem;
+  color: #a0a0a0;
+  margin-top: 0.5rem;
+  letter-spacing: 2px;
+  font-weight: 300;
+}
+
+.aircraft-details {
+  margin: 2rem 0;
+}
+
+.section-title {
+  font-size: 1.1rem;
+  color: #a0a0a0;
+  text-transform: uppercase;
+  letter-spacing: 2px;
+  font-weight: 400;
+  margin-bottom: 1.5rem;
+  text-align: center;
+}
+
 .flight-info {
   margin: 2rem 0;
 }
