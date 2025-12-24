@@ -254,24 +254,91 @@ async function compressJSON(data) {
 }
 
 /**
- * Upload to Cloudflare R2 with progress tracking
+ * Upload individual aircraft records to R2
+ * @param {Object} aircraftDb - Aircraft database object keyed by icao24
+ */
+async function uploadIndividualFiles(aircraftDb) {
+  console.log('☁️  Uploading individual aircraft files to R2...\n');
+  
+  try {
+    // Initialize S3 client for R2
+    const s3Client = new S3Client({
+      region: 'auto',
+      endpoint: `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+      credentials: {
+        accessKeyId: R2_ACCESS_KEY_ID,
+        secretAccessKey: R2_SECRET_ACCESS_KEY,
+      },
+    });
+
+    const icao24List = Object.keys(aircraftDb);
+    const totalRecords = icao24List.length;
+    let uploadedCount = 0;
+    const startTime = Date.now();
+    const batchSize = 50; // Upload 50 files at a time to avoid overwhelming the system
+
+    console.log(`   Uploading ${totalRecords} individual aircraft records...`);
+    console.log(`   Batch size: ${batchSize} files\n`);
+
+    // Process in batches
+    for (let i = 0; i < icao24List.length; i += batchSize) {
+      const batch = icao24List.slice(i, i + batchSize);
+      const uploadPromises = batch.map(async (icao24) => {
+        const aircraftInfo = aircraftDb[icao24];
+        const jsonString = JSON.stringify(aircraftInfo);
+        const jsonBuffer = Buffer.from(jsonString, 'utf-8');
+        const key = `aircraft/${icao24}.json`;
+
+        try {
+          const command = new PutObjectCommand({
+            Bucket: R2_BUCKET_NAME,
+            Key: key,
+            Body: jsonBuffer,
+            ContentType: 'application/json',
+          });
+
+          await s3Client.send(command);
+          uploadedCount++;
+          
+          // Show progress every 100 files
+          if (uploadedCount % 100 === 0 || uploadedCount === totalRecords) {
+            const percent = ((uploadedCount / totalRecords) * 100).toFixed(1);
+            process.stdout.write(`\r   Progress: ${uploadedCount}/${totalRecords} (${percent}%)`);
+          }
+        } catch (error) {
+          console.error(`\n   ⚠️  Failed to upload ${key}: ${error.message}`);
+        }
+      });
+
+      await Promise.all(uploadPromises);
+    }
+
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.log(`\n✅ Successfully uploaded ${uploadedCount} individual aircraft files`);
+    console.log(`   Upload time: ${elapsed} seconds`);
+    console.log(`   Average: ${(uploadedCount / parseFloat(elapsed)).toFixed(1)} files/second`);
+  } catch (error) {
+    console.error('\n❌ Error uploading individual files to R2:', error.message);
+    if (error.name === 'CredentialsError' || error.name === 'InvalidAccessKeyId') {
+      console.error('   Please check your R2 credentials (R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY)');
+    } else if (error.name === 'NoSuchBucket') {
+      console.error(`   Bucket "${R2_BUCKET_NAME}" does not exist. Please create it in Cloudflare R2.`);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Upload to Cloudflare R2 with progress tracking (legacy - for large file)
  */
 async function uploadToR2(compressedData) {
-  console.log('☁️  Uploading to Cloudflare R2...\n');
+  console.log('☁️  Uploading compressed database to R2 (legacy format)...\n');
   
   // Debug: Show R2 configuration
   console.log('📋 R2 Configuration:');
   console.log(`   Account ID: ${R2_ACCOUNT_ID ? R2_ACCOUNT_ID.substring(0, 8) + '...' : 'NOT SET'}`);
   console.log(`   Bucket Name: ${R2_BUCKET_NAME || 'NOT SET'}`);
   console.log(`   Object Key: ${R2_OBJECT_KEY}`);
-  console.log(`   Bucket Name Type: ${typeof R2_BUCKET_NAME}`);
-  console.log(`   Bucket Name Length: ${R2_BUCKET_NAME ? R2_BUCKET_NAME.length : 0}`);
-  if (R2_BUCKET_NAME) {
-    console.log(`   Bucket Name (raw): "${R2_BUCKET_NAME}"`);
-    // Show character codes to help debug
-    const charCodes = Array.from(R2_BUCKET_NAME).map(c => `${c} (U+${c.charCodeAt(0).toString(16).toUpperCase().padStart(4, '0')})`).join(', ');
-    console.log(`   Bucket Name (chars): ${charCodes}`);
-  }
   console.log('');
   
   try {
@@ -369,14 +436,17 @@ async function main() {
     // Step 2: Parse and extract relevant data
     const aircraftDb = parseCSV(csvText);
 
-    // Step 3: Convert to JSON and compress
-    const compressedData = await compressJSON(aircraftDb);
+    // Step 3: Upload individual files to R2 (new on-demand approach)
+    await uploadIndividualFiles(aircraftDb);
 
-    // Step 4: Upload to R2
+    // Step 4: Also upload compressed database as fallback (optional)
+    console.log('\n📦 Uploading compressed database as fallback...');
+    const compressedData = await compressJSON(aircraftDb);
     await uploadToR2(compressedData);
 
     console.log('\n✅ Aircraft database sync completed successfully!');
-    console.log(`   R2 location: ${R2_BUCKET_NAME}/${R2_OBJECT_KEY}`);
+    console.log(`   Individual files: ${R2_BUCKET_NAME}/aircraft/*.json`);
+    console.log(`   Legacy file: ${R2_BUCKET_NAME}/${R2_OBJECT_KEY}`);
   } catch (error) {
     console.error('\n❌ Sync failed:', error.message);
     process.exit(1);

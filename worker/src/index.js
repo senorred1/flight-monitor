@@ -32,12 +32,13 @@ let lastFlightsCache = {
 }
 const FLIGHTS_CACHE_MAX_AGE = 30 * 1000 // Cache flights for up to 30 seconds
 
-// Aircraft database cache (loaded from R2)
-let aircraftDbCache = {
-  data: null,
-  timestamp: 0
+// Aircraft database cache (per-record cache for on-demand lookups)
+let aircraftRecordCache = {
+  // Structure: { [icao24]: { data: {...}, timestamp: number } }
+  records: {},
+  maxSize: 1000 // Maximum number of records to cache
 }
-const AIRCRAFT_DB_CACHE_MAX_AGE = 24 * 60 * 60 * 1000 // Cache for 24 hours
+const AIRCRAFT_RECORD_CACHE_MAX_AGE = 60 * 60 * 1000 // Cache each record for 1 hour
 
 // Test mode flag - set to false when ready to use real OpenSky API
 const USE_SYNTHETIC_DATA = false
@@ -244,79 +245,68 @@ async function fetchOpenSkyData(clientId, clientSecret, isMapChange = false) {
 }
 
 /**
- * Load aircraft database from R2 storage
+ * Get aircraft information on-demand from R2 storage
+ * Fetches individual JSON files per icao24 with caching
  * @param {Object} r2Bucket - R2 bucket binding
- * @returns {Promise<Object|null>} - Aircraft database object keyed by icao24, or null if error
+ * @param {string} icao24 - ICAO24 address (will be normalized to lowercase)
+ * @returns {Promise<Object|null>} - Aircraft information object or null if not found
  */
-async function loadAircraftDatabase(r2Bucket) {
-  const now = Date.now()
-  
-  // Check if we have a valid cached database
-  if (aircraftDbCache.data && (now - aircraftDbCache.timestamp) < AIRCRAFT_DB_CACHE_MAX_AGE) {
-    return aircraftDbCache.data
-  }
-  
-  if (!r2Bucket) {
-    console.log('R2 bucket not available, skipping aircraft database load')
+async function getAircraftInfoOnDemand(r2Bucket, icao24) {
+  if (!r2Bucket || !icao24) {
     return null
   }
   
+  const now = Date.now()
+  const normalizedIcao24 = icao24.toLowerCase()
+  
+  // Check cache first
+  const cached = aircraftRecordCache.records[normalizedIcao24]
+  if (cached && (now - cached.timestamp) < AIRCRAFT_RECORD_CACHE_MAX_AGE) {
+    return cached.data
+  }
+  
+  // Cache miss or expired - fetch from R2
   try {
-    console.log('Loading aircraft database from R2...')
-    console.log(`R2 bucket type: ${typeof r2Bucket}, has get method: ${typeof r2Bucket?.get}`)
-    
-    // Try to get the compressed database file
-    const objectKey = 'aircraft-db.json.gz'
-    console.log(`Attempting to fetch object with key: "${objectKey}"`)
-    
+    const objectKey = `aircraft/${normalizedIcao24}.json`
     const object = await r2Bucket.get(objectKey)
     
     if (!object) {
-      console.log(`❌ Aircraft database not found in R2 (key: "${objectKey}")`)
-      console.log('💡 To fix this, run: npm run sync-aircraft-db')
-      console.log('   This will download and upload the aircraft database to R2')
-      
-      // Try alternative keys in case the file was uploaded with a different name
-      const testKeys = ['aircraft-db.json', 'aircraft_db.json.gz']
-      for (const testKey of testKeys) {
-        try {
-          const testObject = await r2Bucket.get(testKey)
-          if (testObject) {
-            console.log(`✅ Found object with alternative key: "${testKey}"`)
-            // Use the found object
-            const compressedData = await testObject.arrayBuffer()
-            const decompressedData = await decompressGzip(compressedData)
-            const jsonText = new TextDecoder().decode(decompressedData)
-            const aircraftDb = JSON.parse(jsonText)
-            
-            aircraftDbCache.data = aircraftDb
-            aircraftDbCache.timestamp = now
-            
-            console.log(`✅ Aircraft database loaded: ${Object.keys(aircraftDb).length} entries`)
-            return aircraftDb
-          }
-        } catch (testError) {
-          // Continue to next key
-        }
+      // Record not found - cache null to avoid repeated lookups
+      aircraftRecordCache.records[normalizedIcao24] = {
+        data: null,
+        timestamp: now
       }
-      
       return null
     }
     
-    // Decompress the gzipped data
-    const compressedData = await object.arrayBuffer()
-    const decompressedData = await decompressGzip(compressedData)
-    const jsonText = new TextDecoder().decode(decompressedData)
-    const aircraftDb = JSON.parse(jsonText)
+    // Parse the JSON file
+    const jsonText = await object.text()
+    const aircraftInfo = JSON.parse(jsonText)
     
-    // Cache the database
-    aircraftDbCache.data = aircraftDb
-    aircraftDbCache.timestamp = now
+    // Cache the result
+    // Implement simple LRU: if cache is full, remove oldest entries
+    const cacheKeys = Object.keys(aircraftRecordCache.records)
+    if (cacheKeys.length >= aircraftRecordCache.maxSize && !aircraftRecordCache.records[normalizedIcao24]) {
+      // Remove oldest 10% of entries
+      const entriesToRemove = Math.floor(cacheKeys.length * 0.1)
+      const sortedByTime = cacheKeys
+        .map(key => ({ key, timestamp: aircraftRecordCache.records[key].timestamp }))
+        .sort((a, b) => a.timestamp - b.timestamp)
+        .slice(0, entriesToRemove)
+      
+      sortedByTime.forEach(({ key }) => {
+        delete aircraftRecordCache.records[key]
+      })
+    }
     
-    console.log(`Aircraft database loaded: ${Object.keys(aircraftDb).length} entries`)
-    return aircraftDb
+    aircraftRecordCache.records[normalizedIcao24] = {
+      data: aircraftInfo,
+      timestamp: now
+    }
+    
+    return aircraftInfo
   } catch (error) {
-    console.error('Error loading aircraft database:', error.message || error)
+    console.error(`Error fetching aircraft info for ${normalizedIcao24}:`, error.message || error)
     return null
   }
 }
@@ -368,19 +358,14 @@ async function decompressGzip(compressedData) {
 }
 
 /**
- * Get aircraft information from database by ICAO24
- * @param {Object} aircraftDb - Aircraft database object
+ * Get aircraft information from database by ICAO24 (legacy function - kept for compatibility)
+ * Now uses on-demand lookups via getAircraftInfoOnDemand
+ * @param {Object} r2Bucket - R2 bucket binding (replaces aircraftDb parameter)
  * @param {string} icao24 - ICAO24 address
- * @returns {Object|null} - Aircraft information or null if not found
+ * @returns {Promise<Object|null>} - Aircraft information or null if not found
  */
-function getAircraftInfo(aircraftDb, icao24) {
-  if (!aircraftDb || !icao24) {
-    return null
-  }
-  
-  // Normalize icao24 to lowercase for lookup
-  const normalizedIcao24 = icao24.toLowerCase()
-  return aircraftDb[normalizedIcao24] || null
+async function getAircraftInfo(r2Bucket, icao24) {
+  return await getAircraftInfoOnDemand(r2Bucket, icao24)
 }
 
 /**
@@ -398,9 +383,9 @@ function getAirportInfo(icao24, callsign) {
 /**
  * Process flight states and check if any are in the monitoring region
  * @param {Array} flights - Array of flight state arrays from OpenSky
- * @param {Object} aircraftDb - Aircraft database object (optional)
+ * @param {Object} r2Bucket - R2 bucket binding for on-demand aircraft lookups
  */
-function processFlights(flights, aircraftDb = null) {
+async function processFlights(flights, r2Bucket = null) {
   if (!flights || flights.length === 0) {
     return null
   }
@@ -428,8 +413,8 @@ function processFlights(flights, aircraftDb = null) {
         const airportInfo = getAirportInfo(flight[0], flight[1])
         const icao24 = flight[0]
         
-        // Enrich with aircraft database information
-        const aircraftInfo = aircraftDb ? getAircraftInfo(aircraftDb, icao24) : null
+        // Enrich with aircraft database information (on-demand lookup)
+        const aircraftInfo = r2Bucket ? await getAircraftInfoOnDemand(r2Bucket, icao24) : null
         
         const flightData = {
           icao24: icao24,
@@ -487,15 +472,20 @@ function isPointInBounds(latitude, longitude, bounds) {
  * @param {Array} flights - Array of flight state arrays from OpenSky
  * @param {number} maxFlights - Maximum number of flights to return
  * @param {Object} bounds - Map bounds object {minLat, maxLat, minLon, maxLon}
- * @param {Object} aircraftDb - Aircraft database object (optional)
+ * @param {Object} r2Bucket - R2 bucket binding for on-demand aircraft lookups
  */
-function processMultipleFlights(flights, maxFlights = 10, bounds = null, aircraftDb = null) {
+async function processMultipleFlights(flights, maxFlights = 10, bounds = null, r2Bucket = null) {
   if (!flights || flights.length === 0) {
     return []
   }
 
   const flightsInBounds = []
+  
+  // Collect all icao24s that need lookup (for potential batch optimization)
+  const icao24sToLookup = []
+  const flightMap = new Map() // Map icao24 to flight data (before enrichment)
 
+  // First pass: filter flights and collect icao24s
   for (const flight of flights) {
     // Flight state format from OpenSky:
     // [icao24, callsign, origin_country, time_position, last_contact, longitude, latitude, 
@@ -525,9 +515,6 @@ function processMultipleFlights(flights, maxFlights = 10, bounds = null, aircraf
         const airportInfo = getAirportInfo(flight[0], flight[1])
         const icao24 = flight[0]
         
-        // Enrich with aircraft database information
-        const aircraftInfo = aircraftDb ? getAircraftInfo(aircraftDb, icao24) : null
-        
         const flightData = {
           icao24: icao24,
           callsign: flight[1] || null,
@@ -542,17 +529,9 @@ function processMultipleFlights(flights, maxFlights = 10, bounds = null, aircraf
           inRegion: inRegion // Always correctly indicate if in monitoring region
         }
         
-        // Add aircraft database fields if available
-        if (aircraftInfo) {
-          if (aircraftInfo.registration) flightData.registration = aircraftInfo.registration
-          if (aircraftInfo.typecode) flightData.aircraftType = aircraftInfo.typecode
-          if (aircraftInfo.owner) flightData.owner = aircraftInfo.owner
-          if (aircraftInfo.operator) flightData.operator = aircraftInfo.operator
-          if (aircraftInfo.manufacturerName) flightData.manufacturer = aircraftInfo.manufacturerName
-          if (aircraftInfo.model) flightData.model = aircraftInfo.model
-          if (aircraftInfo.serialNumber) flightData.serialNumber = aircraftInfo.serialNumber
-          if (aircraftInfo.operatorCallsign) flightData.operatorCallsign = aircraftInfo.operatorCallsign
-          if (aircraftInfo.built) flightData.built = aircraftInfo.built
+        flightMap.set(icao24, flightData)
+        if (r2Bucket && icao24) {
+          icao24sToLookup.push(icao24)
         }
         
         flightsInBounds.push(flightData)
@@ -560,6 +539,32 @@ function processMultipleFlights(flights, maxFlights = 10, bounds = null, aircraf
         if (flightsInBounds.length >= maxFlights) {
           break
         }
+      }
+    }
+  }
+
+  // Second pass: enrich with aircraft database information (fetch in parallel)
+  if (r2Bucket && icao24sToLookup.length > 0) {
+    const lookupPromises = icao24sToLookup.map(icao24 => 
+      getAircraftInfoOnDemand(r2Bucket, icao24).then(info => ({ icao24, info }))
+    )
+    
+    const lookupResults = await Promise.all(lookupPromises)
+    const infoMap = new Map(lookupResults.map(({ icao24, info }) => [icao24.toLowerCase(), info]))
+    
+    // Enrich flight data with aircraft information
+    for (const flightData of flightsInBounds) {
+      const aircraftInfo = infoMap.get(flightData.icao24?.toLowerCase())
+      if (aircraftInfo) {
+        if (aircraftInfo.registration) flightData.registration = aircraftInfo.registration
+        if (aircraftInfo.typecode) flightData.aircraftType = aircraftInfo.typecode
+        if (aircraftInfo.owner) flightData.owner = aircraftInfo.owner
+        if (aircraftInfo.operator) flightData.operator = aircraftInfo.operator
+        if (aircraftInfo.manufacturerName) flightData.manufacturer = aircraftInfo.manufacturerName
+        if (aircraftInfo.model) flightData.model = aircraftInfo.model
+        if (aircraftInfo.serialNumber) flightData.serialNumber = aircraftInfo.serialNumber
+        if (aircraftInfo.operatorCallsign) flightData.operatorCallsign = aircraftInfo.operatorCallsign
+        if (aircraftInfo.built) flightData.built = aircraftInfo.built
       }
     }
   }
@@ -726,10 +731,11 @@ export default {
           bucketNameFromEnv: !!env.R2_BUCKET_NAME
         },
         cacheStatus: {
-          hasCachedData: !!aircraftDbCache.data,
-          cacheTimestamp: aircraftDbCache.timestamp ? new Date(aircraftDbCache.timestamp).toISOString() : null,
-          cacheAge: aircraftDbCache.timestamp ? Math.round((Date.now() - aircraftDbCache.timestamp) / 1000) : null,
-          cacheEntryCount: aircraftDbCache.data ? Object.keys(aircraftDbCache.data).length : 0
+          cacheType: 'per-record',
+          cachedRecords: Object.keys(aircraftRecordCache.records).length,
+          maxCacheSize: aircraftRecordCache.maxSize,
+          cacheTTLMinutes: AIRCRAFT_RECORD_CACHE_MAX_AGE / 1000 / 60,
+          sampleCachedKeys: Object.keys(aircraftRecordCache.records).slice(0, 5)
         }
       }
 
@@ -837,7 +843,30 @@ export default {
                       icao24: key,
                       hasRegistration: !!aircraftDb[key].registration,
                       hasType: !!aircraftDb[key].typecode
-                    }))
+                    })),
+                    note: 'Legacy database format loaded. Individual files should be used for on-demand lookups.'
+                  }
+                  
+                  // Also test on-demand lookup with a sample icao24
+                  if (Object.keys(aircraftDb).length > 0) {
+                    const sampleIcao24 = Object.keys(aircraftDb)[0]
+                    try {
+                      const onDemandResult = await getAircraftInfoOnDemand(env.AIRCRAFT_DB, sampleIcao24)
+                      debugInfo.onDemandTest = {
+                        sampleIcao24: sampleIcao24,
+                        success: !!onDemandResult,
+                        found: onDemandResult ? {
+                          hasRegistration: !!onDemandResult.registration,
+                          hasType: !!onDemandResult.typecode
+                        } : null
+                      }
+                    } catch (onDemandError) {
+                      debugInfo.onDemandTest = {
+                        sampleIcao24: sampleIcao24,
+                        success: false,
+                        error: onDemandError.message
+                      }
+                    }
                   }
                 } catch (loadError) {
                   debugInfo.loadTest = {
@@ -980,8 +1009,7 @@ export default {
         if (flights) {
           console.log(`Processing ${flights.length} flights from OpenSky`)
           // Load aircraft database
-          const aircraftDb = await loadAircraftDatabase(env.AIRCRAFT_DB)
-          flight = processFlights(flights, aircraftDb)
+          flight = await processFlights(flights, env.AIRCRAFT_DB)
           if (flight) {
             // Verify the flight is actually in region before returning
             const verifiedInRegion = isPointInRegion(flight.latitude, flight.longitude, MONITORING_REGION)
@@ -1066,8 +1094,7 @@ export default {
         if (openSkyFlights) {
           console.log(`Processing ${openSkyFlights.length} flights from OpenSky for map`)
           // Load aircraft database
-          const aircraftDb = await loadAircraftDatabase(env.AIRCRAFT_DB)
-          flights = processMultipleFlights(openSkyFlights, 50, bounds, aircraftDb)
+          flights = await processMultipleFlights(openSkyFlights, 50, bounds, env.AIRCRAFT_DB)
           console.log(`Found ${flights.length} flights within map bounds`)
           
           // Cache the successful flights response

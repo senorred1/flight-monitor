@@ -40,6 +40,30 @@
   animation: float 3s ease-in-out infinite;
 }
 
+.aircraft-type-header {
+  font-size: 1.3rem;
+  font-weight: 600;
+  color: #4a9eff;
+  margin-top: 0.75rem;
+  letter-spacing: 1px;
+}
+
+.operator-header {
+  font-size: 1.1rem;
+  color: #b8d4ff;
+  margin-top: 0.5rem;
+  letter-spacing: 0.5px;
+  font-weight: 400;
+}
+
+.aircraft-model-header {
+  font-size: 1rem;
+  color: #a0c8ff;
+  margin-top: 0.4rem;
+  font-style: italic;
+  letter-spacing: 0.5px;
+}
+
 @keyframes float {
   0%, 100% {
     transform: translateY(0);

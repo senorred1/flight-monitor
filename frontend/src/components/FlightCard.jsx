@@ -12,6 +12,20 @@ function FlightCard({ flight }) {
           {flight.callsign && flight.callsign !== (flight.registration || flight.icao24) && (
             <div className="callsign-subtitle">{flight.callsign}</div>
           )}
+          {/* Prominently display aircraft registration fields */}
+          {(flight.aircraftType || flight.typecode) && (
+            <div className="aircraft-type-header">
+              {flight.aircraftType || flight.typecode}
+            </div>
+          )}
+          {flight.operator && (
+            <div className="operator-header">{flight.operator}</div>
+          )}
+          {(flight.manufacturer || flight.model) && (
+            <div className="aircraft-model-header">
+              {[flight.manufacturer, flight.model].filter(Boolean).join(' ')}
+            </div>
+          )}
         </div>
         
         {/* Aircraft Information Section */}
@@ -19,36 +33,40 @@ function FlightCard({ flight }) {
           <>
             <div className="aircraft-details">
               <h2 className="section-title">Aircraft Details</h2>
+              {flight.operator && (
+                <div className="info-row">
+                  <div className="info-label">Operator</div>
+                  <div className="info-value">{flight.operator}</div>
+                </div>
+              )}
+              {flight.manufacturer && (
+                <div className="info-row">
+                  <div className="info-label">Manufacturer</div>
+                  <div className="info-value">{flight.manufacturer}</div>
+                </div>
+              )}
+              {flight.model && (
+                <div className="info-row">
+                  <div className="info-label">Model</div>
+                  <div className="info-value">{flight.model}</div>
+                </div>
+              )}
+              {(flight.aircraftType || flight.typecode) && (
+                <div className="info-row">
+                  <div className="info-label">Type Code</div>
+                  <div className="info-value">{flight.aircraftType || flight.typecode}</div>
+                </div>
+              )}
               {flight.registration && (
                 <div className="info-row">
                   <div className="info-label">Registration</div>
                   <div className="info-value">{flight.registration}</div>
                 </div>
               )}
-              {flight.aircraftType && (
-                <div className="info-row">
-                  <div className="info-label">Type</div>
-                  <div className="info-value">{flight.aircraftType}</div>
-                </div>
-              )}
-              {(flight.manufacturer || flight.model) && (
-                <div className="info-row">
-                  <div className="info-label">Aircraft</div>
-                  <div className="info-value">
-                    {[flight.manufacturer, flight.model].filter(Boolean).join(' ')}
-                  </div>
-                </div>
-              )}
-              {flight.owner && (
+              {flight.owner && flight.owner !== flight.operator && (
                 <div className="info-row">
                   <div className="info-label">Owner</div>
                   <div className="info-value">{flight.owner}</div>
-                </div>
-              )}
-              {flight.operator && flight.operator !== flight.owner && (
-                <div className="info-row">
-                  <div className="info-label">Operator</div>
-                  <div className="info-value">{flight.operator}</div>
                 </div>
               )}
               {flight.built && (
