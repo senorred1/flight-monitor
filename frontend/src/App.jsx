@@ -56,7 +56,9 @@ function App() {
         
         const data = await response.json()
         
-        if (data.flight && data.flight.inRegion) {
+        // Only show flight card if flight exists AND is confirmed to be in the monitoring region
+        // Double-check inRegion flag to prevent showing flights outside the polygon
+        if (data.flight && data.flight.inRegion === true) {
           // Check if this is a new flight (different from previous, or first detection)
           const currentFlightId = data.flight.icao24 || data.flight.callsign || 'unknown'
           const isNewFlight = previousFlightIdRef.current !== currentFlightId
@@ -77,19 +79,19 @@ function App() {
           lastDisplayedFlightRef.current = data.flight
           setFlightData(data.flight)
         } else {
-          // No flight in region currently
+          // No flight in region currently (either no flight returned, or flight.inRegion is false/undefined)
           // Check if we should keep showing the last flight (within 60 seconds)
           const now = Date.now()
           const timeSinceDetection = flightFirstDetectedRef.current 
             ? now - flightFirstDetectedRef.current 
             : Infinity
           
-          if (timeSinceDetection < 60000 && lastDisplayedFlightRef.current) {
-            // Keep showing the last flight for up to 60 seconds
+          if (timeSinceDetection < 60000 && lastDisplayedFlightRef.current && lastDisplayedFlightRef.current.inRegion === true) {
+            // Keep showing the last flight for up to 60 seconds, but only if it was actually in region
             // Don't update previousFlightIdRef - we want to detect if a NEW flight enters
             setFlightData(lastDisplayedFlightRef.current)
           } else {
-            // 60 seconds have passed or no flight was ever detected - clear the card
+            // 60 seconds have passed, no flight was ever detected, or last flight wasn't in region - clear the card
             previousFlightIdRef.current = null
             flightFirstDetectedRef.current = null
             lastDisplayedFlightRef.current = null

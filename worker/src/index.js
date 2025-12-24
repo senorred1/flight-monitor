@@ -78,6 +78,16 @@ function calculateDistance(lat1, lon1, lat2, lon2) {
  * Check if a point is within the monitoring region (circle)
  */
 function isPointInRegion(latitude, longitude, region) {
+  if (!region || !region.center || typeof region.radiusMiles !== 'number') {
+    console.error('Invalid region provided to isPointInRegion:', region)
+    return false
+  }
+  
+  if (typeof latitude !== 'number' || typeof longitude !== 'number' || isNaN(latitude) || isNaN(longitude)) {
+    console.error('Invalid coordinates provided to isPointInRegion:', { latitude, longitude })
+    return false
+  }
+  
   const distance = calculateDistance(
     region.center.lat,
     region.center.lon,
@@ -411,6 +421,7 @@ function processFlights(flights, aircraftDb = null) {
     }
     
     if (latitude && longitude) {
+      // Always verify the flight is actually in the monitoring region
       const inRegion = isPointInRegion(latitude, longitude, MONITORING_REGION)
       
       if (inRegion) {
@@ -431,7 +442,7 @@ function processFlights(flights, aircraftDb = null) {
           velocity: flight[9], // m/s
           heading: flight[10], // degrees
           verticalRate: flight[11], // m/s
-          inRegion: true
+          inRegion: true // Verified above - flight is in monitoring region
         }
         
         // Add aircraft database fields if available
@@ -501,10 +512,14 @@ function processMultipleFlights(flights, maxFlights = 10, bounds = null, aircraf
     }
     
     if (latitude && longitude) {
-      // If bounds provided, check bounds; otherwise check monitoring region
+      // Always check if flight is in monitoring region (for card display)
+      const inRegion = isPointInRegion(latitude, longitude, MONITORING_REGION)
+      
+      // If bounds provided, check if flight is in map bounds (for map display)
+      // Otherwise, only show flights in monitoring region
       const inArea = bounds 
         ? isPointInBounds(latitude, longitude, bounds)
-        : isPointInRegion(latitude, longitude, MONITORING_REGION)
+        : inRegion
       
       if (inArea) {
         const airportInfo = getAirportInfo(flight[0], flight[1])
@@ -524,7 +539,7 @@ function processMultipleFlights(flights, maxFlights = 10, bounds = null, aircraf
           velocity: flight[9], // m/s
           heading: flight[10], // degrees
           verticalRate: flight[11], // m/s
-          inRegion: !bounds || isPointInRegion(latitude, longitude, MONITORING_REGION)
+          inRegion: inRegion // Always correctly indicate if in monitoring region
         }
         
         // Add aircraft database fields if available
@@ -684,9 +699,32 @@ export default {
 
     // Debug endpoint to test R2 access
     if (url.pathname === '/api/debug-r2') {
+      // Helper function to show last 4 digits
+      const last4 = (str) => {
+        if (!str || typeof str !== 'string') return null
+        return str.length >= 4 ? str.slice(-4) : str
+      }
+      
+      // Get R2 configuration info (from env vars if available, or from known config)
+      const accountId = env.R2_ACCOUNT_ID || 'f4ff7aa620b854de61e0e3d9254fd1d1'
+      const accessKeyId = env.R2_ACCESS_KEY_ID || '604a89c12dc65b1dbb11ed40088b7e80'
+      const secretAccessKey = env.R2_SECRET_ACCESS_KEY || '9c4fe281cc7c101088e05cec9cefea3812af386bf47b38d8ff685d7317644430'
+      const bucketName = env.R2_BUCKET_NAME || 'flight-monitor'
+      
       const debugInfo = {
         hasR2Binding: !!env.AIRCRAFT_DB,
         r2BindingType: typeof env.AIRCRAFT_DB,
+        r2BindingMethods: env.AIRCRAFT_DB ? Object.keys(env.AIRCRAFT_DB).filter(k => typeof env.AIRCRAFT_DB[k] === 'function') : [],
+        r2Configuration: {
+          accountIdLast4: last4(accountId),
+          accessKeyIdLast4: last4(accessKeyId),
+          secretAccessKeyLast4: last4(secretAccessKey),
+          bucketName: bucketName,
+          accountIdFromEnv: !!env.R2_ACCOUNT_ID,
+          accessKeyIdFromEnv: !!env.R2_ACCESS_KEY_ID,
+          secretAccessKeyFromEnv: !!env.R2_SECRET_ACCESS_KEY,
+          bucketNameFromEnv: !!env.R2_BUCKET_NAME
+        },
         cacheStatus: {
           hasCachedData: !!aircraftDbCache.data,
           cacheTimestamp: aircraftDbCache.timestamp ? new Date(aircraftDbCache.timestamp).toISOString() : null,
@@ -697,43 +735,140 @@ export default {
 
       if (env.AIRCRAFT_DB) {
         try {
-          // Try to access R2 directly
-          const objectKey = 'aircraft-db.json.gz'
-          debugInfo.r2Access = {
-            objectKey: objectKey,
-            attemptingFetch: true
+          // Try to list objects in the bucket
+          let listResult = null
+          let listError = null
+          
+          try {
+            listResult = await env.AIRCRAFT_DB.list({
+              limit: 10
+            })
+          } catch (listErr) {
+            listError = {
+              message: listErr.message,
+              name: listErr.name,
+              stack: listErr.stack
+            }
+            // Continue even if listing fails - we'll try direct access
+            listResult = { objects: [], truncated: false, cursor: null }
           }
           
-          const object = await env.AIRCRAFT_DB.get(objectKey)
-          debugInfo.r2Access.objectExists = !!object
+          debugInfo.bucketListing = {
+            objects: listResult.objects.map(obj => ({
+              key: obj.key,
+              size: obj.size,
+              uploaded: obj.uploaded ? new Date(obj.uploaded).toISOString() : null,
+              etag: obj.etag || null,
+              httpEtag: obj.httpEtag || null
+            })),
+            truncated: listResult.truncated || false,
+            cursor: listResult.cursor || null,
+            totalObjects: listResult.objects.length,
+            allKeys: listResult.objects.map(obj => obj.key),
+            listError: listError,
+            note: listError ? 'Listing failed, but will try direct file access' : null
+          }
           
-          if (object) {
-            debugInfo.r2Access.objectSize = object.size
-            debugInfo.r2Access.objectLastModified = object.uploaded ? new Date(object.uploaded).toISOString() : null
-            debugInfo.r2Access.objectEtag = object.etag || null
+          // Try to find and load the aircraft database
+          // First, try the expected key directly (even if listing failed or returned empty)
+          const expectedKey = 'aircraft-db.json.gz'
+          let targetKey = null
+          let foundObject = null
+          
+          // Check if expected key exists in the listing (if listing worked)
+          const expectedKeyExists = listResult.objects.length > 0 && listResult.objects.some(obj => obj.key === expectedKey)
+          
+          if (expectedKeyExists) {
+            targetKey = expectedKey
+          } else if (listResult.objects.length > 0) {
+            // Try to find any file that looks like an aircraft database
+            // Look for files containing 'aircraft' (case-insensitive) and ending with .gz, .json.gz, or .json
+            const aircraftDbKeys = listResult.objects
+              .map(obj => obj.key)
+              .filter(key => {
+                const lowerKey = key.toLowerCase()
+                return (lowerKey.includes('aircraft') || lowerKey.includes('db')) && 
+                       (lowerKey.endsWith('.json.gz') || lowerKey.endsWith('.json') || lowerKey.endsWith('.gz'))
+              })
             
-            // Try to load the database
-            const aircraftDb = await loadAircraftDatabase(env.AIRCRAFT_DB)
-            debugInfo.loadTest = {
-              success: !!aircraftDb,
-              entryCount: aircraftDb ? Object.keys(aircraftDb).length : 0,
-              sampleEntries: aircraftDb ? Object.keys(aircraftDb).slice(0, 3).map(key => ({
-                icao24: key,
-                data: aircraftDb[key]
-              })) : null
+            if (aircraftDbKeys.length > 0) {
+              targetKey = aircraftDbKeys[0]
+            } else {
+              // If no obvious match, try the first file (might be the database with a different name)
+              targetKey = listResult.objects[0].key
             }
           } else {
-            // Try alternative keys
-            const alternativeKeys = ['aircraft-db.json', 'aircraft_db.json.gz']
-            debugInfo.alternativeKeys = {}
-            for (const altKey of alternativeKeys) {
-              const altObject = await env.AIRCRAFT_DB.get(altKey)
-              debugInfo.alternativeKeys[altKey] = !!altObject
-              if (altObject) {
-                debugInfo.alternativeKeys[`${altKey}_size`] = altObject.size
+            // Listing returned empty or failed - try the expected key directly anyway
+            // This handles the case where listing doesn't work but direct access does
+            targetKey = expectedKey
+          }
+          
+          debugInfo.searchStrategy = {
+            expectedKey: expectedKey,
+            expectedKeyFound: expectedKeyExists,
+            targetKey: targetKey,
+            allKeysInBucket: listResult.objects.map(obj => obj.key),
+            listingWorked: !listError && listResult.objects.length >= 0,
+            note: listResult.objects.length === 0 ? 'Listing returned empty - trying direct file access anyway' : null
+          }
+          
+          // Always try to access the file, even if listing was empty
+          if (targetKey) {
+            try {
+              foundObject = await env.AIRCRAFT_DB.get(targetKey)
+              if (foundObject) {
+                debugInfo.foundObject = {
+                  key: targetKey,
+                  size: foundObject.size,
+                  uploaded: foundObject.uploaded ? new Date(foundObject.uploaded).toISOString() : null
+                }
+                
+                // Try to load the database
+                try {
+                  const compressedData = await foundObject.arrayBuffer()
+                  const decompressedData = await decompressGzip(compressedData)
+                  const jsonText = new TextDecoder().decode(decompressedData)
+                  const aircraftDb = JSON.parse(jsonText)
+                  
+                  debugInfo.loadTest = {
+                    success: true,
+                    entryCount: Object.keys(aircraftDb).length,
+                    sampleEntries: Object.keys(aircraftDb).slice(0, 3).map(key => ({
+                      icao24: key,
+                      hasRegistration: !!aircraftDb[key].registration,
+                      hasType: !!aircraftDb[key].typecode
+                    }))
+                  }
+                } catch (loadError) {
+                  debugInfo.loadTest = {
+                    success: false,
+                    error: loadError.message,
+                    errorType: loadError.name,
+                    note: 'File found but could not be loaded/decompressed. May not be a gzipped JSON file.'
+                  }
+                }
+              } else {
+                debugInfo.loadTest = {
+                  success: false,
+                  error: `Object ${targetKey} not found after listing`,
+                  note: 'Key was in listing but get() returned null'
+                }
+              }
+            } catch (getError) {
+              debugInfo.loadTest = {
+                success: false,
+                error: getError.message,
+                errorType: getError.name
               }
             }
+          } else {
+            debugInfo.loadTest = {
+              success: false,
+              error: 'No objects found in bucket to test',
+              note: 'Bucket appears to be empty'
+            }
           }
+          
         } catch (error) {
           debugInfo.r2Error = {
             message: error.message,
@@ -848,7 +983,14 @@ export default {
           const aircraftDb = await loadAircraftDatabase(env.AIRCRAFT_DB)
           flight = processFlights(flights, aircraftDb)
           if (flight) {
-            console.log('Found flight in region:', flight.callsign || flight.icao24)
+            // Verify the flight is actually in region before returning
+            const verifiedInRegion = isPointInRegion(flight.latitude, flight.longitude, MONITORING_REGION)
+            if (!verifiedInRegion) {
+              console.warn(`WARNING: Flight ${flight.callsign || flight.icao24} marked as inRegion but verification failed!`)
+              flight = null
+            } else {
+              console.log(`Found flight in region: ${flight.callsign || flight.icao24} (lat: ${flight.latitude.toFixed(4)}, lon: ${flight.longitude.toFixed(4)})`)
+            }
           } else {
             console.log('No flights found in monitoring region')
           }
